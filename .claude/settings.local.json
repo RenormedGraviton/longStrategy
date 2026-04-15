@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import pandas as pd; df = pd.read_parquet\\('/Users/cfan/Documents/projects/202604_dailyStrategy/data/BTCUSDT_binance_futures.parquet'\\); print\\(list\\(df.columns\\)\\); print\\(df.index.name\\)\")",
+      "Bash(python3 -c \"import pyarrow.parquet as pq; f = pq.read_schema\\('/Users/cfan/Documents/projects/202604_dailyStrategy/data/BTCUSDT_binance_futures.parquet'\\); print\\('index:', f.pandas_metadata.get\\('index_columns'\\) if f.pandas_metadata else 'none'\\); print\\('columns:', f.names\\)\")",
+      "Bash(pip3 list:*)",
+      "Read(//Users/cfan/miniforge3/**)",
+      "Read(//Users/cfan/anaconda3/**)",
+      "Read(//Users/cfan/.conda/**)",
+      "Bash(conda env:*)",
+      "Bash(/Users/cfan/miniconda3/bin/python3 -c \"import pandas as pd; df = pd.read_parquet\\('/Users/cfan/Documents/projects/202604_dailyStrategy/data/BTCUSDT_binance_futures.parquet', nrows=0\\); print\\('index:', df.index.name\\); print\\('columns:', list\\(df.columns\\)\\)\")",
+      "Bash(/Users/cfan/miniconda3/bin/conda env:*)"
+    ]
+  }
+}
