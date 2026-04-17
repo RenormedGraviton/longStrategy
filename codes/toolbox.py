@@ -1,9 +1,22 @@
 import os
 import glob
+import pickle
 import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
 import lightgbm as lgb
+
+
+def savePickle(obj, path):
+    """Save an object (dict or anything picklable) to a pickle file."""
+    with open(path, 'wb') as f:
+        pickle.dump(obj, f)
+
+
+def loadPickle(path):
+    """Load an object from a pickle file."""
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 from tqdm.notebook import tqdm
 
 
@@ -37,6 +50,11 @@ class DataLoader:
         return sorted({sym for sym, exch, inst in self._files
                        if exch == exchange and inst == instrument})
 
+    def marketForTicker(self, ticker, instrument):
+        """Return sorted list of exchanges that have the given ticker and instrument."""
+        return sorted({exch for sym, exch, inst in self._files
+                       if sym == ticker and inst == instrument})
+
     def get(self, symbol, exchange, instrument, startDate=None, endDate=None, barFreqInHours=1):
         """Load bars for a symbol, aggregate to a non-overlapping frequency.
 
@@ -52,6 +70,7 @@ class DataLoader:
         df = pd.read_parquet(path)
         df['ts'] = pd.to_datetime(df['ts'], utc=True)
         df = df.sort_values('ts').set_index('ts')
+        df = df[~df.index.duplicated(keep='first')]
         if startDate is not None:
             df = df[df.index >= pd.Timestamp(str(startDate), tz='UTC')]
         if endDate is not None:
@@ -180,6 +199,253 @@ def agg_daniel_data(dl, tickers, exchanges, instruments,
         out['funding_interval_hours'] = raw['funding_interval_hours']
         out['date'] = raw['date']
         out['hoursSinceMidnight'] = raw['hoursSinceMidnight']
+        parts.append(out)
+
+    return pd.concat(parts) if parts else pd.DataFrame()
+
+
+def _exp_sum(series, H):
+    """Exponential sum: x(t) = f(t) + alpha * x(t-1), alpha = exp(-1/H), x(0)=f(0)."""
+    alpha = np.exp(-1.0 / H)
+    vals = series.values.astype(float)
+    out = np.zeros_like(vals)
+    prev = 0.0
+    started = False
+    for i in range(len(vals)):
+        v = vals[i]
+        if np.isnan(v):
+            out[i] = np.nan if not started else prev
+            continue
+        if not started:
+            out[i] = v
+            prev = v
+            started = True
+        else:
+            prev = v + alpha * prev
+            out[i] = prev
+    return pd.Series(out, index=series.index)
+
+
+def _ema(series, H):
+    """True EMA: x(t) = (1-alpha)*f(t) + alpha*x(t-1), alpha=exp(-1/H), x(0)=f(0)."""
+    alpha = np.exp(-1.0 / H)
+    vals = series.values.astype(float)
+    out = np.zeros_like(vals)
+    prev = 0.0
+    started = False
+    for i in range(len(vals)):
+        v = vals[i]
+        if np.isnan(v):
+            out[i] = np.nan if not started else prev
+            continue
+        if not started:
+            out[i] = v
+            prev = v
+            started = True
+        else:
+            prev = (1 - alpha) * v + alpha * prev
+            out[i] = prev
+    return pd.Series(out, index=series.index)
+
+
+def _safe_div(numer, denom):
+    """Divide two Series, returning 0 where denom==0 or result is inf/nan."""
+    result = numer / denom.replace(0, np.nan)
+    return result.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def agg_futures_data(dl, tickers, exchanges, instruments='futures',
+                     startDate=None, endDate=None,
+                     barFreq=4, sampleFreq=None):
+    """Build futures features at 1h resolution, apply exponential sums, subsample to sampleFreq.
+
+    Loads raw 1h data, computes per-hour features, applies exponential sums / true EMA,
+    then subsamples to the desired sampleFreq. Spot CVD is aggregated across all spot
+    markets for each ticker.
+
+    All ratio and normalization divisions are zero-protected (0 when denom == 0).
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    if isinstance(exchanges, str):
+        exchanges = [exchanges]
+    if isinstance(instruments, str):
+        instruments = [instruments]
+    if sampleFreq is None:
+        sampleFreq = barFreq
+
+    H1, H2, H3 = barFreq, 2 * barFreq, 24
+
+    combos = [(t, e, i) for t in tickers for e in exchanges for i in instruments]
+    parts = []
+    for ticker, exch, inst in tqdm(combos, desc='Loading futures'):
+        try:
+            # always load at 1h resolution
+            raw = dl.get_sophi(ticker, exch, inst, startDate, endDate,
+                               barFreqInHours=1, sampleFreqInHours=1)
+        except (FileNotFoundError, KeyError):
+            continue
+
+        # spot CVD & volume: sum across all spot markets for this ticker (at 1h)
+        spot_markets = dl.marketForTicker(ticker, 'spot')
+        spot_cvd = None
+        spot_vol = None
+        for sm in spot_markets:
+            try:
+                spot_raw = dl.get_sophi(ticker, sm, 'spot', startDate, endDate,
+                                        barFreqInHours=1, sampleFreqInHours=1)
+            except (FileNotFoundError, KeyError):
+                continue
+            aligned_cvd = spot_raw['cvd_usdt'].reindex(raw.index).fillna(0.0)
+            aligned_vol = spot_raw['volume_usdt'].reindex(raw.index).fillna(0.0)
+            spot_cvd = aligned_cvd if spot_cvd is None else spot_cvd + aligned_cvd
+            spot_vol = aligned_vol if spot_vol is None else spot_vol + aligned_vol
+
+        has_spot = spot_cvd is not None
+        if not has_spot:
+            spot_cvd = pd.Series(np.nan, index=raw.index)
+            spot_vol = pd.Series(np.nan, index=raw.index)
+
+        out = pd.DataFrame(index=raw.index)
+        out.index.name = 'ts'
+        out['ticker'] = ticker
+        out['exchange'] = exch
+        out['instrument'] = inst
+
+        price = raw['close']
+        vol = raw['volume_usdt']
+        oi = raw['open_interest']
+        cvd = raw['cvd_usdt']
+
+        out['price'] = price
+        out['volume_usdt'] = vol
+
+        # 1. dprice, dprice_ratio with ES at H1, H2, H3
+        dprice = price - price.shift(1)
+        dprice_ratio = _safe_div(dprice, price.shift(1))
+        for H in [H1, H2, H3]:
+            out[f'dprice_es{H}'] = _exp_sum(dprice, H)
+            out[f'dprice_ratio_es{H}'] = _exp_sum(dprice_ratio, H)
+
+        # 2. oi exp sum at H1
+        out[f'oi_es{H1}'] = _exp_sum(oi, H1)
+
+        # 3. doi exp sum at H1
+        doi = oi - oi.shift(1)
+        out[f'doi_es{H1}'] = _exp_sum(doi, H1)
+
+        # 4. doi_ratio exp sum at H1
+        doi_ratio = _safe_div(doi, oi.shift(1))
+        out[f'doi_ratio_es{H1}'] = _exp_sum(doi_ratio, H1)
+
+        # 5. oi_native = oi/price, mirror 2-4
+        oi_native = _safe_div(oi, price)
+        out[f'oi_native_es{H1}'] = _exp_sum(oi_native, H1)
+        doi_native = oi_native - oi_native.shift(1)
+        out[f'doi_native_es{H1}'] = _exp_sum(doi_native, H1)
+        doi_native_ratio = _safe_div(doi_native, oi_native.shift(1))
+        out[f'doi_native_ratio_es{H1}'] = _exp_sum(doi_native_ratio, H1)
+
+        # 6. cvd exp sums at H1, H2, H3
+        cvd_es = {}
+        for H in [H1, H2, H3]:
+            cvd_es[H] = _exp_sum(cvd, H)
+            out[f'cvd_es{H}'] = cvd_es[H]
+
+        # 7. dcvd exp sums at H1, H2, H3
+        dcvd = cvd - cvd.shift(1)
+        dcvd_es = {}
+        for H in [H1, H2, H3]:
+            dcvd_es[H] = _exp_sum(dcvd, H)
+            out[f'dcvd_es{H}'] = dcvd_es[H]
+
+        # volume exp sums at H1, H2 (for cvd_vol / dcvd_vol ratios)
+        vol_es = {}
+        for H in [H1, H2]:
+            vol_es[H] = _exp_sum(vol, H)
+
+        # cvd_vol: ES(cvd)/ES(vol) at H1, H2
+        for H in [H1, H2]:
+            out[f'cvd_vol_es{H}'] = _safe_div(cvd_es[H], vol_es[H])
+
+        # dcvd_vol: ES(dcvd)/ES(vol) at H1, H2
+        for H in [H1, H2]:
+            out[f'dcvd_vol_es{H}'] = _safe_div(dcvd_es[H], vol_es[H])
+
+        # 8. dcvd_ratio exp sums at H1, H2, H3
+        dcvd_ratio = _safe_div(dcvd, cvd.shift(1).abs())
+        for H in [H1, H2, H3]:
+            out[f'dcvd_ratio_es{H}'] = _exp_sum(dcvd_ratio, H)
+
+        # 9. abs(cvd) true EMA at H=240, normalize features 6 and 7
+        abs_cvd_ema240 = _ema(cvd.abs(), 240)
+        out['abs_cvd_ema240'] = abs_cvd_ema240
+        for H in [H1, H2, H3]:
+            out[f'cvd_es{H}_norm'] = _safe_div(cvd_es[H], abs_cvd_ema240)
+            out[f'dcvd_es{H}_norm'] = _safe_div(dcvd_es[H], abs_cvd_ema240)
+
+        # 10. |cvd_es{H1}| diff, exp sum at H1
+        abs_cvd_es_bar = cvd_es[H1].abs()
+        d_abs_cvd_es_bar = abs_cvd_es_bar - abs_cvd_es_bar.shift(1)
+        d_abs_cvd_es_bar_es = _exp_sum(d_abs_cvd_es_bar, H1)
+        out[f'd_abs_cvd_es_bar_es{H1}'] = d_abs_cvd_es_bar_es
+
+        # 11. ratio version
+        d_abs_cvd_es_bar_ratio = _safe_div(d_abs_cvd_es_bar, abs_cvd_es_bar.shift(1))
+        out[f'd_abs_cvd_es_bar_ratio_es{H1}'] = _exp_sum(d_abs_cvd_es_bar_ratio, H1)
+
+        # 12. normalize feature 10 by feature 9
+        out[f'd_abs_cvd_es_bar_es{H1}_norm'] = _safe_div(d_abs_cvd_es_bar_es, abs_cvd_ema240)
+
+        # 13. Mirror 6-12 for spot_cvd
+        scvd_es = {}
+        for H in [H1, H2, H3]:
+            scvd_es[H] = _exp_sum(spot_cvd, H)
+            out[f'spot_cvd_es{H}'] = scvd_es[H]
+
+        dspot_cvd = spot_cvd - spot_cvd.shift(1)
+        dscvd_es = {}
+        for H in [H1, H2, H3]:
+            dscvd_es[H] = _exp_sum(dspot_cvd, H)
+            out[f'dspot_cvd_es{H}'] = dscvd_es[H]
+
+        dspot_cvd_ratio = _safe_div(dspot_cvd, spot_cvd.shift(1).abs())
+        for H in [H1, H2, H3]:
+            out[f'dspot_cvd_ratio_es{H}'] = _exp_sum(dspot_cvd_ratio, H)
+
+        abs_spot_cvd_ema240 = _ema(spot_cvd.abs(), 240)
+        out['abs_spot_cvd_ema240'] = abs_spot_cvd_ema240
+        for H in [H1, H2, H3]:
+            out[f'spot_cvd_es{H}_norm'] = _safe_div(scvd_es[H], abs_spot_cvd_ema240)
+            out[f'dspot_cvd_es{H}_norm'] = _safe_div(dscvd_es[H], abs_spot_cvd_ema240)
+
+        abs_spot_cvd_es_bar = scvd_es[H1].abs()
+        d_abs_spot_cvd_es_bar = abs_spot_cvd_es_bar - abs_spot_cvd_es_bar.shift(1)
+        d_abs_spot_cvd_es_bar_es = _exp_sum(d_abs_spot_cvd_es_bar, H1)
+        out[f'd_abs_spot_cvd_es_bar_es{H1}'] = d_abs_spot_cvd_es_bar_es
+
+        d_abs_spot_cvd_es_bar_ratio = _safe_div(d_abs_spot_cvd_es_bar, abs_spot_cvd_es_bar.shift(1))
+        out[f'd_abs_spot_cvd_es_bar_ratio_es{H1}'] = _exp_sum(d_abs_spot_cvd_es_bar_ratio, H1)
+
+        out[f'd_abs_spot_cvd_es_bar_es{H1}_norm'] = _safe_div(d_abs_spot_cvd_es_bar_es, abs_spot_cvd_ema240)
+
+        # spot/futures volume features
+        out['spot_volume_usdt'] = spot_vol
+        out['spot_fut_vol_ratio'] = _safe_div(spot_vol, vol)
+        fut_vol_es24 = _exp_sum(vol, 24)
+        spot_vol_es24 = _exp_sum(spot_vol, 24)
+        out['fut_volume_es24'] = fut_vol_es24
+        out['spot_volume_es24'] = spot_vol_es24
+        out['spot_fut_vol_es24_ratio'] = _safe_div(spot_vol_es24, fut_vol_es24)
+
+        out['funding_rate'] = raw['funding_rate']
+        out['funding_rate_avg'] = raw['funding_rate_avg']
+        out['funding_interval_hours'] = raw['funding_interval_hours']
+        out['date'] = raw['date']
+        out['hoursSinceMidnight'] = raw['hoursSinceMidnight']
+
+        # subsample to sampleFreq (end-of-window convention, same as get_sophi)
+        out = out.iloc[sampleFreq - 1::sampleFreq]
         parts.append(out)
 
     return pd.concat(parts) if parts else pd.DataFrame()
@@ -931,3 +1197,467 @@ def showStockSelection(ypred_train, ypred_valid, o_valid, cutoff_quantile):
     ax.set_yticklabels([unique_tickers[j] for j in range(0, n_tickers, tstep)], fontsize=6)
 
     fig.tight_layout()
+
+
+def findBumpAndDump(prices, left=24, right=24, bumpThreshold=0.5, dumpThreshold=0.6):
+    """Detect pump-and-dump events in a single ticker's price series.
+
+    Parameters
+    ----------
+    prices : pd.Series – price series indexed by timestamp
+    left : int – lookback window in bars
+    right : int – lookforward window in bars
+    bumpThreshold : float – minimum rise ratio (e.g. 0.5 = 50%)
+    dumpThreshold : float – minimum fall ratio (e.g. 0.6 = 60%)
+
+    Returns
+    -------
+    (peak_time, context_prices) or (None, None) if no event found
+        peak_time : timestamp of the peak
+        context_prices : pd.Series sliced ±20 days around the peak
+    """
+    p = prices.values
+    idx = prices.index
+    n = len(p)
+
+    candidates = []
+    for t in range(left, n - right):
+        rise = (p[t] - p[t - left]) / p[t - left]
+        fall = (p[t] - p[t + right]) / p[t]
+        if rise > bumpThreshold and fall > dumpThreshold:
+            candidates.append((t, p[t]))
+
+    if not candidates:
+        return None, None
+
+    # pick the candidate with the highest price
+    best_t = max(candidates, key=lambda x: x[1])[0]
+    peak_time = idx[best_t]
+
+    # slice ±20 days around peak
+    start = peak_time - pd.Timedelta(days=20)
+    end = peak_time + pd.Timedelta(days=20)
+    context = prices[(prices.index >= start) & (prices.index <= end)]
+
+    return peak_time, context
+
+
+def findBumpAndDumpV2(prices, threshold=2):
+    """Detect pump-and-dump by checking if max price exceeds threshold * median.
+
+    Parameters
+    ----------
+    prices : pd.Series – price series indexed by timestamp
+    threshold : float – max price must be > threshold * median price
+
+    Returns
+    -------
+    (peak_time, context_prices) or (None, None) if no event found
+        peak_time : timestamp of the peak
+        context_prices : pd.Series sliced ±20 days around the peak
+    """
+    peak_idx = prices.idxmax()
+    max_price = prices[peak_idx]
+    median_before = prices[prices.index < peak_idx].median()
+
+    if np.isnan(median_before) or max_price < threshold * median_before:
+        return None, None
+
+    peak_time = peak_idx
+    start = peak_time - pd.Timedelta(days=20)
+    end = peak_time + pd.Timedelta(days=20)
+    context = prices[(prices.index >= start) & (prices.index <= end)]
+
+    return peak_time, context
+
+
+def peakCvdProfile(raw_df, threshold=2, left_days=20, right_days=5):
+    """Extract normalized CVD profile around a detected pump-and-dump peak.
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame – output of get/get_sophi with 'close' and 'cvd_usdt' columns,
+        indexed by timestamp (1h bars)
+    threshold : float – passed to findBumpAndDumpV2
+    left_days : int – days before peak to include
+    right_days : int – days after peak to include
+
+    Returns
+    -------
+    result : np.ndarray of shape (left_days*24 + right_days*24,) – normalized CVD
+    price_profile : np.ndarray of same shape – price / price_max
+    peak_time : timestamp
+    Returns (None, None, None) if no peak found.
+    """
+    peak_time, _ = findBumpAndDumpV2(raw_df['close'], threshold=threshold)
+    if peak_time is None:
+        return None, None, None
+
+    total_len = left_days * 24 + right_days * 24
+    start = peak_time - pd.Timedelta(days=left_days)
+    end = peak_time + pd.Timedelta(days=right_days)
+
+    # context window
+    context_mask = (raw_df.index >= start) & (raw_df.index < end)
+    context_cvd = raw_df.loc[context_mask, 'cvd_usdt']
+
+    # denominator: 80th percentile of |cvd_usdt| outside the context
+    outside_cvd = raw_df.loc[~context_mask, 'cvd_usdt']
+    denom = np.quantile(np.abs(outside_cvd.dropna().values), 0.8)
+    if denom == 0:
+        denom = 1.0
+
+    normalized = context_cvd.values / denom
+
+    # price profile: price / price_max
+    context_price = raw_df.loc[context_mask, 'close']
+    price_max = raw_df['close'].max()
+    norm_price = context_price.values / price_max
+
+    # pad to fixed length: left_days*24 bars before peak, right_days*24 after
+    actual_start = context_cvd.index[0] if len(context_cvd) > 0 else peak_time
+    left_pad = max(0, int((actual_start - start).total_seconds() / 3600))
+    right_pad = max(0, total_len - left_pad - len(normalized))
+
+    result = np.concatenate([
+        np.zeros(left_pad),
+        normalized,
+        np.zeros(right_pad),
+    ])[:total_len]
+    if len(result) < total_len:
+        result = np.concatenate([result, np.zeros(total_len - len(result))])
+
+    price_profile = np.concatenate([
+        np.zeros(left_pad),
+        norm_price,
+        np.zeros(right_pad),
+    ])[:total_len]
+    if len(price_profile) < total_len:
+        price_profile = np.concatenate([price_profile, np.zeros(total_len - len(price_profile))])
+
+    return result, price_profile, peak_time
+
+
+def peakPredProfiles(pred, O, peak_ratio=1.5, left_days=10, right_days=5):
+    """Extract normalized price and prediction profiles around each ticker's peak.
+
+    For each ticker in O:
+      1. Find the max-price point.
+      2. If max_price / avg_price > peak_ratio, include this ticker.
+      3. Extract a window from [peak - left_days, peak + right_days].
+      4. Pad edges by nearest available value (ffill/bfill).
+      5. Normalize price by max_price.
+
+    Returns two matrices (n_tickers, T) sorted by max/avg ratio (largest first).
+
+    Parameters
+    ----------
+    pred : np.ndarray (n,) – prediction aligned with O's rows (by position)
+    O : pd.DataFrame – must have 'ticker', 'price', 'date', 'hoursSinceMidnight'
+    peak_ratio : float – inclusion threshold on max_price/avg_price
+    left_days, right_days : int – window around peak in days
+
+    Returns
+    -------
+    price_matrix : np.ndarray (n_events, T) – normalized prices (peak=1)
+    pred_matrix : np.ndarray (n_events, T) – corresponding predictions
+    tickers : list – ticker names in sorted order (matching rows)
+    peak_times : list – peak timestamps
+    """
+    pred = np.asarray(pred, dtype=float)
+
+    # reconstruct ts from date + hoursSinceMidnight; attach pred
+    work = O.copy().reset_index(drop=True)
+    ts = pd.to_datetime(work['date'].astype(int).astype(str), format='%Y%m%d', utc=True) \
+        + pd.to_timedelta(work['hoursSinceMidnight'].astype(int), unit='h')
+    work = work.assign(_ts=ts, _pred=pred).set_index('_ts').sort_index()
+
+    # detect bar spacing from first ticker
+    first_ticker = work['ticker'].iloc[0]
+    first_idx = work[work['ticker'] == first_ticker].sort_index().index
+    if len(first_idx) < 2:
+        raise ValueError("Not enough rows to detect bar spacing")
+    bar_hours = (first_idx[1] - first_idx[0]).total_seconds() / 3600
+    bars_per_day = 24 / bar_hours
+    T = int(round((left_days + right_days) * bars_per_day))
+
+    results = []  # list of (ratio, price_row, pred_row, ticker, peak_time)
+    for ticker, grp in work.groupby('ticker'):
+        grp = grp.sort_index()
+        grp = grp[~grp.index.duplicated(keep='first')]
+        prices = grp['price']
+        if len(prices) == 0:
+            continue
+        max_price = prices.max()
+        avg_price = prices.mean()
+        if avg_price == 0 or np.isnan(avg_price):
+            continue
+        ratio = max_price / avg_price
+        if ratio <= peak_ratio:
+            continue
+
+        peak_time = prices.idxmax()
+        start = peak_time - pd.Timedelta(days=left_days)
+
+        # regular grid at bar_hours spacing
+        grid = pd.date_range(start=start, periods=T, freq=f'{int(bar_hours)}h')
+
+        price_aligned = prices.reindex(grid, method='nearest',
+                                       tolerance=pd.Timedelta(hours=int(bar_hours)))
+        price_aligned = price_aligned.ffill().bfill()
+
+        pred_aligned = grp['_pred'].reindex(grid, method='nearest',
+                                            tolerance=pd.Timedelta(hours=int(bar_hours)))
+        pred_aligned = pred_aligned.ffill().bfill()
+
+        norm_price = price_aligned.values / max_price
+        results.append((ratio, norm_price, pred_aligned.values, ticker, peak_time))
+
+    if not results:
+        return (np.zeros((0, T)), np.zeros((0, T)), [], [])
+
+    # sort by ratio descending
+    results.sort(key=lambda x: x[0], reverse=True)
+
+    price_matrix = np.stack([r[1] for r in results])
+    pred_matrix = np.stack([r[2] for r in results])
+    tickers = [r[3] for r in results]
+    peak_times = [r[4] for r in results]
+
+    return price_matrix, pred_matrix, tickers, peak_times
+
+
+def getDailyReturnExact(long_short, y_valid, o_valid, horizon='ret_24h',
+                        masked_tickers=None):
+    """Per-date daily return aggregated as mean-of-hourly-means.
+
+    For each date:
+      1. Group by hoursSinceMidnight
+      2. For each hour, compute mean(return * long_short) across all tickers
+      3. Average the hourly means to get the daily return
+
+    Parameters
+    ----------
+    long_short : array-like (n,) – position vector (+1/-1/0)
+    y_valid : pd.DataFrame – must contain `horizon` column
+    o_valid : pd.DataFrame – must contain 'date', 'hoursSinceMidnight'
+    horizon : str – column name in y_valid
+    masked_tickers : list of str or None – tickers whose returns should be
+        zeroed out (rows with these tickers contribute 0 to the signal*return
+        numerator but still count in the position denominator)
+
+    Returns
+    -------
+    pd.Series – indexed by date, daily return values
+    """
+    ls = np.asarray(long_short, dtype=float).copy()
+    if masked_tickers is not None and len(masked_tickers) > 0:
+        mask = o_valid['ticker'].isin(masked_tickers).values
+        ls[mask] = 0.0
+    y = y_valid[horizon].values
+    df = pd.DataFrame({
+        'date': o_valid['date'].values,
+        'hour': o_valid['hoursSinceMidnight'].values,
+        'num': ls * y,
+        'den': np.abs(ls),
+    })
+    # sum per (date, hour)
+    grp = df.groupby(['date', 'hour']).agg(num=('num', 'sum'), den=('den', 'sum'))
+    # per-hour return: sum(ls*ret) / sum(|ls|), or 0 if no position
+    grp['r'] = np.where(grp['den'] > 0, grp['num'] / grp['den'].replace(0, np.nan), 0.0)
+    # active flag: include only hours where we actually had a position
+    grp['active'] = grp['den'] > 0
+
+    # average only active hours within each date
+    def _mean_active(g):
+        active = g[g['active']]
+        if len(active) == 0:
+            return 0.0
+        return active['r'].mean()
+
+    daily = grp.groupby('date').apply(_mean_active)
+    return daily
+
+
+def causal_long_short(long_short, O, cooldown_hours=48):
+    """Enforce per-direction cooldown on a long_short signal vector.
+
+    After a +1 signal at time t, any subsequent +1 within `cooldown_hours`
+    (same ticker) is zeroed out. Same for -1. A +1 does not affect subsequent
+    -1 signals and vice versa (direction flips are allowed).
+
+    Parameters
+    ----------
+    long_short : array-like (n,) – values in {+1, -1, 0}
+    O : pd.DataFrame – must contain 'date' and 'hoursSinceMidnight'; if 'ticker'
+        is present, the cooldown is applied per ticker independently
+    cooldown_hours : int – cooldown window in hours (default 48)
+
+    Returns
+    -------
+    np.ndarray (n,) – filtered long_short vector (same order as input)
+    """
+    ls = np.asarray(long_short, dtype=float).copy()
+    n = len(ls)
+
+    # reconstruct ts hours since epoch
+    date = O['date'].astype(int).astype(str).values
+    hour = O['hoursSinceMidnight'].astype(int).values
+    ts = pd.to_datetime(date, format='%Y%m%d', utc=True) + pd.to_timedelta(hour, unit='h')
+    ts_hours = (ts.astype('int64') // (3600 * 10**9)).to_numpy()  # epoch hours
+
+    ticker = O['ticker'].values if 'ticker' in O.columns else np.zeros(n, dtype=object)
+
+    # process per ticker
+    out = ls.copy()
+    for t_val in pd.unique(ticker):
+        mask = (ticker == t_val)
+        idx = np.where(mask)[0]
+        # sort within ticker by time
+        order = np.argsort(ts_hours[idx])
+        sorted_idx = idx[order]
+        sorted_hours = ts_hours[sorted_idx]
+        sorted_ls = out[sorted_idx].copy()
+
+        last_long = -np.inf
+        last_short = -np.inf
+        for k, i in enumerate(sorted_idx):
+            h = sorted_hours[k]
+            if sorted_ls[k] == 1:
+                if h - last_long < cooldown_hours:
+                    out[i] = 0
+                else:
+                    last_long = h
+            elif sorted_ls[k] == -1:
+                if h - last_short < cooldown_hours:
+                    out[i] = 0
+                else:
+                    last_short = h
+
+    return out
+
+
+def showFeatureImportance(model, feature_names=None, importance_type='gain', top=None):
+    """Plot LightGBM feature importance as a horizontal bar chart.
+
+    Parameters
+    ----------
+    model : lgb.Booster – fitted model from fitLgb
+    feature_names : list of str or None – if None, uses model.feature_name()
+    importance_type : 'gain' or 'split' – gain = total loss reduction,
+        split = number of times feature was used
+    top : int or None – show only the top N features (default: all)
+
+    Returns
+    -------
+    pd.DataFrame – columns [feature, importance], sorted descending
+    """
+    import matplotlib.pyplot as plt
+
+    if feature_names is None:
+        feature_names = model.feature_name()
+    importance = model.feature_importance(importance_type=importance_type)
+
+    df = pd.DataFrame({'feature': feature_names, 'importance': importance})
+    df = df.sort_values('importance', ascending=False).reset_index(drop=True)
+
+    plot_df = df.head(top) if top else df
+    n = len(plot_df)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, max(3, 0.3 * n)))
+    ax.barh(np.arange(n)[::-1], plot_df['importance'].values)
+    ax.set_yticks(np.arange(n)[::-1])
+    ax.set_yticklabels(plot_df['feature'].values, fontsize=8)
+    ax.set_xlabel(f'importance ({importance_type})')
+    ax.set_title(f'Feature importance ({importance_type})')
+    ax.grid(True, axis='x', alpha=0.3)
+    plt.tight_layout()
+
+    return df
+
+
+def showLongShortStockSelection(long_short, O_valid):
+    """Heatmap of long/short/flat positions: stocks x dates.
+
+    For rows with multiple (ticker, date) entries (different hours), the sign
+    of the sum is shown.
+
+    Parameters
+    ----------
+    long_short : array-like (n,) – values in {+1, -1, 0}
+    O_valid : pd.DataFrame – must contain 'ticker', 'date'
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    ls = np.asarray(long_short, dtype=float)
+    tickers = O_valid['ticker'].values
+    dates = O_valid['date'].values
+
+    df = pd.DataFrame({'ticker': tickers, 'date': dates, 'ls': ls})
+    # aggregate multi-hour entries by sum, then take sign
+    agg = df.groupby(['ticker', 'date'])['ls'].sum().reset_index()
+    agg['pos'] = np.sign(agg['ls']).astype(int)
+
+    unique_dates = sorted(agg['date'].unique())
+    # sort tickers by total activity (|long_short| sum) descending
+    activity = df.assign(abs_ls=df['ls'].abs()).groupby('ticker')['abs_ls'].sum()
+    unique_tickers = activity.sort_values(ascending=False).index.tolist()
+
+    ticker_to_row = {t: i for i, t in enumerate(unique_tickers)}
+    date_to_col = {d: j for j, d in enumerate(unique_dates)}
+
+    matrix = np.zeros((len(unique_tickers), len(unique_dates)))
+    for _, row in agg.iterrows():
+        r = ticker_to_row[row['ticker']]
+        c = date_to_col[row['date']]
+        matrix[r, c] = row['pos']
+
+    cmap = ListedColormap(['green', 'white', 'red'])
+    fig, ax = plt.subplots(1, 1, figsize=(20, 12))
+    ax.imshow(matrix, aspect='auto', cmap=cmap, vmin=-1, vmax=1, interpolation='nearest')
+    ax.set_xlabel('date')
+    ax.set_ylabel('ticker (more active -> top)')
+    ax.set_title('Long/short stock selection')
+
+    n_dates = len(unique_dates)
+    step = max(1, n_dates // 15)
+    ax.set_xticks(range(0, n_dates, step))
+    ax.set_xticklabels([unique_dates[j] for j in range(0, n_dates, step)],
+                       rotation=90, fontsize=6)
+
+    n_tickers = len(unique_tickers)
+    tstep = max(1, n_tickers // 30)
+    ax.set_yticks(range(0, n_tickers, tstep))
+    ax.set_yticklabels([unique_tickers[j] for j in range(0, n_tickers, tstep)], fontsize=6)
+
+    fig.tight_layout()
+
+
+def getLongShortInfo(long_short, O_val):
+    """Return a DataFrame of nonzero long/short signals with timestamps.
+
+    Parameters
+    ----------
+    long_short : array-like (n,) – values in {+1, -1, 0}
+    O_val : pd.DataFrame – must contain 'ticker', 'date', 'hoursSinceMidnight'
+
+    Returns
+    -------
+    pd.DataFrame with columns [ts, date, hoursSinceMidnight, ticker, signal]
+        sorted by ts, only rows where signal != 0
+    """
+    ls = np.asarray(long_short, dtype=float)
+    date = O_val['date'].astype(int).astype(str).values
+    hour = O_val['hoursSinceMidnight'].astype(int).values
+    ts = pd.to_datetime(date, format='%Y%m%d', utc=True) + pd.to_timedelta(hour, unit='h')
+
+    df = pd.DataFrame({
+        'ts': ts,
+        'date': O_val['date'].values,
+        'hoursSinceMidnight': O_val['hoursSinceMidnight'].values,
+        'ticker': O_val['ticker'].values,
+        'signal': ls.astype(int),
+    })
+    df = df[df['signal'] != 0].sort_values('ts').reset_index(drop=True)
+    return df

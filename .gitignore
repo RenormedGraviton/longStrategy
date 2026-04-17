@@ -1,6 +1,7 @@
 # Data folders
 data/
 data2/
+*.pkl
 
 # Python cache
 __pycache__/
