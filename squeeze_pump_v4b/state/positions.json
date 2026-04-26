@@ -1,0 +1,24 @@
+{
+  "positions": [
+    {
+      "symbol": "EDGEUSDT",
+      "tag": "binance_futures",
+      "entry_ts": "2026-04-03T08:00:00+00:00",
+      "entry_close": 0.9266,
+      "peak": 1.1637
+    },
+    {
+      "symbol": "AIOTUSDT",
+      "tag": "binance_futures",
+      "entry_ts": "2026-04-03T22:00:00+00:00",
+      "entry_close": 0.03987,
+      "peak": 0.03987
+    }
+  ],
+  "last_buys": {
+    "VVVUSDT": "2026-04-01T05:00:00+00:00",
+    "AIOTUSDT": "2026-04-03T22:00:00+00:00",
+    "BANKUSDT": "2026-04-01T17:00:00+00:00",
+    "EDGEUSDT": "2026-04-03T08:00:00+00:00"
+  }
+}
