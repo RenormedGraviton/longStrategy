@@ -57,9 +57,11 @@ from core import (LiveLoader, PumpModel, append_jsonl, load_config,
                   process_tick, utc_now_floor_hour)
 
 
-def _sleep_until_next_hour(buffer_sec: int = 5) -> None:
-    """Sleep until N seconds past the next UTC hour (gives upstream time
-    to flush bars before we wake)."""
+def _sleep_until_next_hour(buffer_sec: int = 1) -> None:
+    """Sleep until N seconds past the next UTC hour. We only need a tiny
+    margin to clear the boundary — the per-tick freshness loop polls
+    upstream every `recheck_interval_sec` for up to `max_wait_min`, so
+    waiting longer here is redundant."""
     now = datetime.now(timezone.utc)
     nxt = (now.replace(minute=0, second=0, microsecond=0)
            + timedelta(hours=1, seconds=buffer_sec))
