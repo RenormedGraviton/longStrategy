@@ -17,24 +17,44 @@ def loadPickle(path):
     """Load an object from a pickle file."""
     with open(path, 'rb') as f:
         return pickle.load(f)
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
+
+
+def normalize_symbol(sym, exchange):
+    """Normalize a symbol to a standard form.
+
+    E.g. OKEx '0G-USDT-SWAP' or '0G-USDT' -> '0GUSDT'; Binance/Bybit/Bitget
+    unchanged.
+    """
+    s = sym.upper()
+    if "okex" in exchange.lower():
+        s = s.replace("-USDT-SWAP", "USDT").replace("-USDT", "USDT")
+    return s
 
 
 class DataLoader:
-    """Loader for a folder of parquet files named {symbol}_{exchange}_{instrument}.parquet."""
+    """Loader for a folder of parquet files named {symbol}_{exchange}_{instrument}.parquet.
+
+    Symbol names are normalized (e.g. OKEx '0G-USDT-SWAP' -> '0GUSDT') so all
+    public APIs use the normalized form. The original filename is tracked
+    internally via `_file_lookup`.
+    """
 
     def __init__(self, data_folder):
         self.data_folder = os.path.abspath(data_folder)
         files = glob.glob(os.path.join(self.data_folder, '*.parquet'))
         self._files = []
+        self._file_lookup = {}  # (norm_sym, exchange, instrument) -> raw_sym
         exchanges = set()
         instruments = set()
         symbols = set()
         for f in files:
             parts = os.path.basename(f).replace('.parquet', '').split('_')
-            sym, exch, inst = parts[0], parts[1], parts[2]
-            self._files.append((sym, exch, inst))
-            symbols.add(sym)
+            raw_sym, exch, inst = parts[0], parts[1], parts[2]
+            norm_sym = normalize_symbol(raw_sym, exch)
+            self._files.append((norm_sym, exch, inst))
+            self._file_lookup[(norm_sym, exch, inst)] = raw_sym
+            symbols.add(norm_sym)
             exchanges.add(exch)
             instruments.add(inst)
         self.symbols = sorted(symbols)
@@ -64,8 +84,12 @@ class DataLoader:
                               barFreqInHours=barFreqInHours, sampleFreqInHours=barFreqInHours)
 
     def _load_raw(self, symbol, exchange, instrument, startDate=None, endDate=None):
-        """Load raw 1h bars, filtered by date range."""
-        fname = f"{symbol}_{exchange}_{instrument}.parquet"
+        """Load raw 1h bars, filtered by date range. Accepts normalized symbol."""
+        key = (symbol, exchange, instrument)
+        if key not in self._file_lookup:
+            raise FileNotFoundError(f"No data for {symbol} {exchange} {instrument}")
+        raw_sym = self._file_lookup[key]
+        fname = f"{raw_sym}_{exchange}_{instrument}.parquet"
         path = os.path.join(self.data_folder, fname)
         df = pd.read_parquet(path)
         df['ts'] = pd.to_datetime(df['ts'], utc=True)
@@ -451,7 +475,441 @@ def agg_futures_data(dl, tickers, exchanges, instruments='futures',
     return pd.concat(parts) if parts else pd.DataFrame()
 
 
-def makeReturns(dl, df, horizons=1, adjustFundingRate=False):
+def agg_withJustin_data(dl, tickers, exchanges, instruments='futures',
+                        startDate=None, endDate=None,
+                        barFreq=4, sampleFreq=None):
+    """Same as agg_futures_data but extended with Justin's unique features.
+
+    Adds (on top of agg_futures_data):
+      - log_oi_level
+      - funding_7d_avg (168h rolling mean)
+      - Simple pct_change features at 1h/4h/24h/3d/7d horizons for price, volume,
+        OI (dollar), OI-coin (oi/price)
+      - Simple CVD diffs at 1h/4h/24h/7d for both perp and spot
+      - Multi-exchange spot CVD 7d diff
+      - Multi-exchange perp OI 7d diff (sum across all perp-like exchanges)
+      - total_cvd_7d (perp + spot combined)
+      - spot_price_vs_perp basis (spot avg close vs perp close)
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    if isinstance(exchanges, str):
+        exchanges = [exchanges]
+    if isinstance(instruments, str):
+        instruments = [instruments]
+    if sampleFreq is None:
+        sampleFreq = barFreq
+
+    H1, H2, H3 = barFreq, 2 * barFreq, 24
+    PERP_INSTS = {'futures', 'perps', 'swap'}
+
+    combos = [(t, e, i) for t in tickers for e in exchanges for i in instruments]
+    parts = []
+    for ticker, exch, inst in tqdm(combos, desc='Loading w/ Justin'):
+        try:
+            raw = dl.get_sophi(ticker, exch, inst, startDate, endDate,
+                               barFreqInHours=1, sampleFreqInHours=1)
+        except (FileNotFoundError, KeyError):
+            continue
+
+        # spot CVD, volume, close: aggregate across all spot markets at 1h
+        spot_markets = dl.marketForTicker(ticker, 'spot')
+        spot_cvd = None
+        spot_vol = None
+        spot_close_sum = None
+        spot_close_cnt = pd.Series(0, index=raw.index)
+        for sm in spot_markets:
+            try:
+                spot_raw = dl.get_sophi(ticker, sm, 'spot', startDate, endDate,
+                                        barFreqInHours=1, sampleFreqInHours=1)
+            except (FileNotFoundError, KeyError):
+                continue
+            aligned_cvd = spot_raw['cvd_usdt'].reindex(raw.index).fillna(0.0)
+            aligned_vol = spot_raw['volume_usdt'].reindex(raw.index).fillna(0.0)
+            aligned_close = spot_raw['close'].reindex(raw.index)
+            spot_cvd = aligned_cvd if spot_cvd is None else spot_cvd + aligned_cvd
+            spot_vol = aligned_vol if spot_vol is None else spot_vol + aligned_vol
+            # sum only non-NaN closes, count them for mean
+            mask = aligned_close.notna()
+            spot_close_sum = aligned_close.fillna(0.0) if spot_close_sum is None \
+                else spot_close_sum + aligned_close.fillna(0.0)
+            spot_close_cnt = spot_close_cnt + mask.astype(int)
+
+        has_spot = spot_cvd is not None
+        if not has_spot:
+            spot_cvd = pd.Series(np.nan, index=raw.index)
+            spot_vol = pd.Series(np.nan, index=raw.index)
+            spot_close_mean = pd.Series(np.nan, index=raw.index)
+        else:
+            spot_close_mean = _safe_div(spot_close_sum, spot_close_cnt.replace(0, np.nan))
+            # restore NaN where nothing was observed
+            spot_close_mean = spot_close_mean.where(spot_close_cnt > 0)
+
+        # multi-exchange PERP OI: sum diff(7d) across all perp-like markets
+        # (futures, perps, swap) for this ticker, in addition to the primary
+        multi_oi_7d = pd.Series(0.0, index=raw.index)
+        has_any_perp = False
+        for inst_candidate in ['futures', 'perps', 'swap']:
+            for pm in dl.marketForTicker(ticker, inst_candidate):
+                if pm == exch and inst_candidate == inst:
+                    continue  # primary handled below
+                try:
+                    perp_raw = dl.get_sophi(ticker, pm, inst_candidate, startDate, endDate,
+                                            barFreqInHours=1, sampleFreqInHours=1)
+                except (FileNotFoundError, KeyError):
+                    continue
+                aligned_oi = perp_raw['open_interest'].reindex(raw.index)
+                multi_oi_7d = multi_oi_7d.add(aligned_oi.diff(7 * 24), fill_value=0)
+                has_any_perp = True
+
+        out = pd.DataFrame(index=raw.index)
+        out.index.name = 'ts'
+        out['ticker'] = ticker
+        out['exchange'] = exch
+        out['instrument'] = inst
+
+        price = raw['close']
+        vol = raw['volume_usdt']
+        oi = raw['open_interest']
+        cvd = raw['cvd_usdt']
+
+        out['price'] = price
+        out['volume_usdt'] = vol
+
+        # ────── my original agg_futures_data features ──────
+        dprice = price - price.shift(1)
+        dprice_ratio = _safe_div(dprice, price.shift(1))
+        for H in [H1, H2, H3]:
+            out[f'dprice_es{H}'] = _exp_sum(dprice, H)
+            out[f'dprice_ratio_es{H}'] = _exp_sum(dprice_ratio, H)
+
+        out[f'oi_es{H1}'] = _exp_sum(oi, H1)
+        doi = oi - oi.shift(1)
+        out[f'doi_es{H1}'] = _exp_sum(doi, H1)
+        doi_ratio = _safe_div(doi, oi.shift(1))
+        out[f'doi_ratio_es{H1}'] = _exp_sum(doi_ratio, H1)
+
+        oi_native = _safe_div(oi, price)
+        out[f'oi_native_es{H1}'] = _exp_sum(oi_native, H1)
+        doi_native = oi_native - oi_native.shift(1)
+        out[f'doi_native_es{H1}'] = _exp_sum(doi_native, H1)
+        doi_native_ratio = _safe_div(doi_native, oi_native.shift(1))
+        out[f'doi_native_ratio_es{H1}'] = _exp_sum(doi_native_ratio, H1)
+
+        cvd_es = {}
+        for H in [H1, H2, H3]:
+            cvd_es[H] = _exp_sum(cvd, H)
+            out[f'cvd_es{H}'] = cvd_es[H]
+
+        dcvd = cvd - cvd.shift(1)
+        dcvd_es = {}
+        for H in [H1, H2, H3]:
+            dcvd_es[H] = _exp_sum(dcvd, H)
+            out[f'dcvd_es{H}'] = dcvd_es[H]
+
+        vol_es = {}
+        for H in [H1, H2]:
+            vol_es[H] = _exp_sum(vol, H)
+        for H in [H1, H2]:
+            out[f'cvd_vol_es{H}'] = _safe_div(cvd_es[H], vol_es[H])
+            out[f'dcvd_vol_es{H}'] = _safe_div(dcvd_es[H], vol_es[H])
+
+        dcvd_ratio = _safe_div(dcvd, cvd.shift(1).abs())
+        for H in [H1, H2, H3]:
+            out[f'dcvd_ratio_es{H}'] = _exp_sum(dcvd_ratio, H)
+
+        abs_cvd_ema240 = _ema(cvd.abs(), 240)
+        out['abs_cvd_ema240'] = abs_cvd_ema240
+        for H in [H1, H2, H3]:
+            out[f'cvd_es{H}_norm'] = _safe_div(cvd_es[H], abs_cvd_ema240)
+            out[f'dcvd_es{H}_norm'] = _safe_div(dcvd_es[H], abs_cvd_ema240)
+
+        abs_cvd_es_bar = cvd_es[H1].abs()
+        d_abs_cvd_es_bar = abs_cvd_es_bar - abs_cvd_es_bar.shift(1)
+        d_abs_cvd_es_bar_es = _exp_sum(d_abs_cvd_es_bar, H1)
+        out[f'd_abs_cvd_es_bar_es{H1}'] = d_abs_cvd_es_bar_es
+        d_abs_cvd_es_bar_ratio = _safe_div(d_abs_cvd_es_bar, abs_cvd_es_bar.shift(1))
+        out[f'd_abs_cvd_es_bar_ratio_es{H1}'] = _exp_sum(d_abs_cvd_es_bar_ratio, H1)
+        out[f'd_abs_cvd_es_bar_es{H1}_norm'] = _safe_div(d_abs_cvd_es_bar_es, abs_cvd_ema240)
+
+        scvd_es = {}
+        for H in [H1, H2, H3]:
+            scvd_es[H] = _exp_sum(spot_cvd, H)
+            out[f'spot_cvd_es{H}'] = scvd_es[H]
+
+        dspot_cvd = spot_cvd - spot_cvd.shift(1)
+        dscvd_es = {}
+        for H in [H1, H2, H3]:
+            dscvd_es[H] = _exp_sum(dspot_cvd, H)
+            out[f'dspot_cvd_es{H}'] = dscvd_es[H]
+
+        dspot_cvd_ratio = _safe_div(dspot_cvd, spot_cvd.shift(1).abs())
+        for H in [H1, H2, H3]:
+            out[f'dspot_cvd_ratio_es{H}'] = _exp_sum(dspot_cvd_ratio, H)
+
+        abs_spot_cvd_ema240 = _ema(spot_cvd.abs(), 240)
+        out['abs_spot_cvd_ema240'] = abs_spot_cvd_ema240
+        for H in [H1, H2, H3]:
+            out[f'spot_cvd_es{H}_norm'] = _safe_div(scvd_es[H], abs_spot_cvd_ema240)
+            out[f'dspot_cvd_es{H}_norm'] = _safe_div(dscvd_es[H], abs_spot_cvd_ema240)
+
+        abs_spot_cvd_es_bar = scvd_es[H1].abs()
+        d_abs_spot_cvd_es_bar = abs_spot_cvd_es_bar - abs_spot_cvd_es_bar.shift(1)
+        d_abs_spot_cvd_es_bar_es = _exp_sum(d_abs_spot_cvd_es_bar, H1)
+        out[f'd_abs_spot_cvd_es_bar_es{H1}'] = d_abs_spot_cvd_es_bar_es
+        d_abs_spot_cvd_es_bar_ratio = _safe_div(d_abs_spot_cvd_es_bar, abs_spot_cvd_es_bar.shift(1))
+        out[f'd_abs_spot_cvd_es_bar_ratio_es{H1}'] = _exp_sum(d_abs_spot_cvd_es_bar_ratio, H1)
+        out[f'd_abs_spot_cvd_es_bar_es{H1}_norm'] = _safe_div(d_abs_spot_cvd_es_bar_es, abs_spot_cvd_ema240)
+
+        out['spot_volume_usdt'] = spot_vol
+        out['spot_fut_vol_ratio'] = _safe_div(spot_vol, vol)
+        fut_vol_es24 = _exp_sum(vol, 24)
+        spot_vol_es24 = _exp_sum(spot_vol, 24)
+        out['fut_volume_es24'] = fut_vol_es24
+        out['spot_volume_es24'] = spot_vol_es24
+        out['spot_fut_vol_es24_ratio'] = _safe_div(spot_vol_es24, fut_vol_es24)
+
+        # ────── Justin's unique features (no BTC) ──────
+
+        # level
+        out['log_oi_level'] = np.log1p(oi)
+
+        # funding 7d avg
+        out['funding_7d_avg'] = raw['funding_rate'].rolling(7 * 24, min_periods=7 * 12).mean()
+
+        # simple pct returns
+        out['ret_1h_pct'] = price.pct_change(1) * 100
+        out['ret_4h_pct'] = price.pct_change(4) * 100
+        out['ret_1d_pct'] = price.pct_change(24) * 100
+        out['ret_3d_pct'] = price.pct_change(3 * 24) * 100
+
+        # simple volume pct changes
+        out['vol_1h_pct'] = vol.pct_change(1) * 100
+        out['vol_24h_pct'] = vol.pct_change(24) * 100
+        vol_4h = vol.rolling(4).sum()
+        vol_4h_prev = vol.shift(4).rolling(4).sum()
+        out['vol_chg_4h_pct'] = _safe_div(vol_4h, vol_4h_prev).replace(0, np.nan).fillna(1.0).sub(1.0) * 100
+
+        # OI pct changes
+        out['oi_chg_4h_pct'] = oi.pct_change(4) * 100
+        out['oi_3d_chg_pct'] = oi.pct_change(3 * 24) * 100
+        out['oi_7d_chg_pct'] = oi.pct_change(7 * 24) * 100
+
+        # OI-coin pct changes (oi / price)
+        out['oi_coin_1h_chg_pct'] = oi_native.pct_change(1) * 100
+        out['oi_coin_chg_4h_pct'] = oi_native.pct_change(4) * 100
+        out['oi_coin_24h_chg_pct'] = oi_native.pct_change(24) * 100
+        out['oi_coin_3d_chg_pct'] = oi_native.pct_change(3 * 24) * 100
+        out['oi_coin_7d_chg_pct'] = oi_native.pct_change(7 * 24) * 100
+
+        # simple CVD diffs (perp)
+        out['perp_cvd_1h'] = cvd.diff(1)
+        out['perp_cvd_4h'] = cvd.diff(4)
+        out['perp_cvd_24h'] = cvd.diff(24)
+        out['perp_cvd_7d'] = cvd.diff(7 * 24)
+
+        # simple CVD diffs (spot, summed)
+        out['spot_cvd_1h'] = spot_cvd.diff(1)
+        out['spot_cvd_4h'] = spot_cvd.diff(4)
+        out['spot_cvd_24h'] = spot_cvd.diff(24)
+        out['spot_cvd_7d'] = spot_cvd.diff(7 * 24)
+
+        # multi-exchange spot CVD 7d (same as spot_cvd_7d since spot_cvd
+        # already sums across spot markets) — alias for clarity
+        out['multi_exchange_spot_cvd_7d'] = out['spot_cvd_7d']
+
+        # total CVD 7d (perp + spot)
+        out['total_cvd_7d'] = out['perp_cvd_7d'].fillna(0) + out['spot_cvd_7d'].fillna(0)
+
+        # multi-exchange perp OI 7d change (own + others)
+        own_oi_7d = oi.diff(7 * 24)
+        out['multi_exchange_oi_7d_chg'] = own_oi_7d.fillna(0) + (multi_oi_7d if has_any_perp else 0)
+
+        # spot-perp basis
+        out['spot_price_vs_perp'] = _safe_div(spot_close_mean - price, price)
+
+        out['funding_rate'] = raw['funding_rate']
+        out['funding_rate_avg'] = raw['funding_rate_avg']
+        out['funding_interval_hours'] = raw['funding_interval_hours']
+        out['date'] = raw['date']
+        out['hoursSinceMidnight'] = raw['hoursSinceMidnight']
+
+        out = out.iloc[sampleFreq - 1::sampleFreq]
+        parts.append(out)
+
+    return pd.concat(parts) if parts else pd.DataFrame()
+
+
+def agg_justin_data(dl, tickers, exchanges, instruments='futures',
+                    startDate=None, endDate=None,
+                    barFreq=4, sampleFreq=None):
+    """Justin's feature set only (no exponential sums, no BTC context).
+
+    Features:
+      - Level: log_oi_level
+      - Funding: funding_rate, funding_7d_avg
+      - Returns (simple pct_change): ret_1h_pct, ret_4h_pct, ret_1d_pct, ret_3d_pct
+      - Volume pct: vol_1h_pct, vol_24h_pct, vol_chg_4h_pct
+      - OI pct: oi_chg_4h_pct, oi_3d_chg_pct, oi_7d_chg_pct
+      - OI-coin pct (oi/price): oi_coin_1h/4h/24h/3d/7d_chg_pct
+      - Perp CVD diffs: perp_cvd_1h, cvd_chg_4h, perp_cvd_24h, perp_cvd_7d
+      - Spot CVD diffs: spot_cvd_1h/4h/24h/7d (spot aggregated across all spot markets)
+      - Spot/perp ratios: spot_perp_vol_ratio (24h), spot_price_vs_perp
+      - Multi-exchange: multi_exchange_spot_cvd_7d, total_cvd_7d, multi_exchange_oi_7d_chg
+
+    Skipped from Justin's original list:
+      - market_cap_proxy, oi_mcap_ratio: degenerate since OI in data2 is in dollars
+      - BTC returns: no BTC data available in data2
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    if isinstance(exchanges, str):
+        exchanges = [exchanges]
+    if isinstance(instruments, str):
+        instruments = [instruments]
+    if sampleFreq is None:
+        sampleFreq = barFreq
+
+    combos = [(t, e, i) for t in tickers for e in exchanges for i in instruments]
+    parts = []
+    for ticker, exch, inst in tqdm(combos, desc='Loading justin'):
+        try:
+            raw = dl.get_sophi(ticker, exch, inst, startDate, endDate,
+                               barFreqInHours=1, sampleFreqInHours=1)
+        except (FileNotFoundError, KeyError):
+            continue
+
+        # aggregate spot: cvd, volume, close (mean) across spot markets
+        spot_markets = dl.marketForTicker(ticker, 'spot')
+        spot_cvd = None
+        spot_vol = None
+        spot_close_sum = None
+        spot_close_cnt = pd.Series(0, index=raw.index)
+        for sm in spot_markets:
+            try:
+                spot_raw = dl.get_sophi(ticker, sm, 'spot', startDate, endDate,
+                                        barFreqInHours=1, sampleFreqInHours=1)
+            except (FileNotFoundError, KeyError):
+                continue
+            aligned_cvd = spot_raw['cvd_usdt'].reindex(raw.index).fillna(0.0)
+            aligned_vol = spot_raw['volume_usdt'].reindex(raw.index).fillna(0.0)
+            aligned_close = spot_raw['close'].reindex(raw.index)
+            spot_cvd = aligned_cvd if spot_cvd is None else spot_cvd + aligned_cvd
+            spot_vol = aligned_vol if spot_vol is None else spot_vol + aligned_vol
+            mask = aligned_close.notna()
+            spot_close_sum = aligned_close.fillna(0.0) if spot_close_sum is None \
+                else spot_close_sum + aligned_close.fillna(0.0)
+            spot_close_cnt = spot_close_cnt + mask.astype(int)
+
+        has_spot = spot_cvd is not None
+        if not has_spot:
+            spot_cvd = pd.Series(np.nan, index=raw.index)
+            spot_vol = pd.Series(np.nan, index=raw.index)
+            spot_close_mean = pd.Series(np.nan, index=raw.index)
+        else:
+            spot_close_mean = _safe_div(spot_close_sum, spot_close_cnt.replace(0, np.nan))
+            spot_close_mean = spot_close_mean.where(spot_close_cnt > 0)
+
+        # multi-exchange perp OI 7d change (sum across all perp-like markets)
+        multi_oi_7d = pd.Series(0.0, index=raw.index)
+        has_any_other_perp = False
+        for inst_candidate in ['futures', 'perps', 'swap']:
+            for pm in dl.marketForTicker(ticker, inst_candidate):
+                if pm == exch and inst_candidate == inst:
+                    continue
+                try:
+                    perp_raw = dl.get_sophi(ticker, pm, inst_candidate, startDate, endDate,
+                                            barFreqInHours=1, sampleFreqInHours=1)
+                except (FileNotFoundError, KeyError):
+                    continue
+                aligned_oi = perp_raw['open_interest'].reindex(raw.index)
+                multi_oi_7d = multi_oi_7d.add(aligned_oi.diff(7 * 24), fill_value=0)
+                has_any_other_perp = True
+
+        out = pd.DataFrame(index=raw.index)
+        out.index.name = 'ts'
+        out['ticker'] = ticker
+        out['exchange'] = exch
+        out['instrument'] = inst
+
+        price = raw['close']
+        vol = raw['volume_usdt']
+        oi = raw['open_interest']
+        cvd = raw['cvd_usdt']
+        oi_native = _safe_div(oi, price)
+
+        out['price'] = price
+        out['volume_usdt'] = vol
+
+        # level
+        out['log_oi_level'] = np.log1p(oi)
+
+        # funding
+        out['funding_rate'] = raw['funding_rate']
+        out['funding_7d_avg'] = raw['funding_rate'].rolling(7 * 24, min_periods=7 * 12).mean()
+
+        # simple price returns
+        out['ret_1h_pct'] = price.pct_change(1) * 100
+        out['ret_4h_pct'] = price.pct_change(4) * 100
+        out['ret_1d_pct'] = price.pct_change(24) * 100
+        out['ret_3d_pct'] = price.pct_change(3 * 24) * 100
+
+        # simple volume pct changes
+        out['vol_1h_pct'] = vol.pct_change(1) * 100
+        out['vol_24h_pct'] = vol.pct_change(24) * 100
+        vol_4h = vol.rolling(4).sum()
+        vol_4h_prev = vol.shift(4).rolling(4).sum()
+        out['vol_chg_4h_pct'] = _safe_div(vol_4h, vol_4h_prev).replace(0, np.nan).fillna(1.0).sub(1.0) * 100
+
+        # OI pct changes (dollar)
+        out['oi_chg_4h_pct'] = oi.pct_change(4) * 100
+        out['oi_3d_chg_pct'] = oi.pct_change(3 * 24) * 100
+        out['oi_7d_chg_pct'] = oi.pct_change(7 * 24) * 100
+
+        # OI-coin pct changes
+        out['oi_coin_1h_chg_pct'] = oi_native.pct_change(1) * 100
+        out['oi_coin_chg_4h_pct'] = oi_native.pct_change(4) * 100
+        out['oi_coin_24h_chg_pct'] = oi_native.pct_change(24) * 100
+        out['oi_coin_3d_chg_pct'] = oi_native.pct_change(3 * 24) * 100
+        out['oi_coin_7d_chg_pct'] = oi_native.pct_change(7 * 24) * 100
+
+        # perp CVD diffs
+        out['perp_cvd_1h'] = cvd.diff(1)
+        out['cvd_chg_4h'] = cvd.diff(4)
+        out['perp_cvd_24h'] = cvd.diff(24)
+        out['perp_cvd_7d'] = cvd.diff(7 * 24)
+
+        # spot CVD diffs (from aggregated spot cvd)
+        out['spot_cvd_1h'] = spot_cvd.diff(1)
+        out['spot_cvd_4h'] = spot_cvd.diff(4)
+        out['spot_cvd_24h'] = spot_cvd.diff(24)
+        out['spot_cvd_7d'] = spot_cvd.diff(7 * 24)
+
+        # multi-exchange aggregates
+        out['multi_exchange_spot_cvd_7d'] = out['spot_cvd_7d']
+        out['total_cvd_7d'] = out['perp_cvd_7d'].fillna(0) + out['spot_cvd_7d'].fillna(0)
+        own_oi_7d = oi.diff(7 * 24)
+        out['multi_exchange_oi_7d_chg'] = own_oi_7d.fillna(0) + (multi_oi_7d if has_any_other_perp else 0)
+
+        # spot/perp ratios
+        spot_vol_24h = spot_vol.rolling(24, min_periods=12).sum()
+        perp_vol_24h = vol.rolling(24, min_periods=12).sum()
+        out['spot_perp_vol_ratio'] = _safe_div(spot_vol_24h, perp_vol_24h)
+        out['spot_price_vs_perp'] = _safe_div(spot_close_mean - price, price)
+
+        out['funding_interval_hours'] = raw['funding_interval_hours']
+        out['date'] = raw['date']
+        out['hoursSinceMidnight'] = raw['hoursSinceMidnight']
+
+        out = out.iloc[sampleFreq - 1::sampleFreq]
+        parts.append(out)
+
+    return pd.concat(parts) if parts else pd.DataFrame()
+
+
+def makeReturns(dl, df, horizons=1, adjustFundingRate=False,
+                addPumpLabel=False, pumpThreshold=1.5,
+                pumpForwardHours=14*24, pumpMinHistoryHours=3*24):
     """Compute forward returns matching the timestamps in df.
 
     Parameters
@@ -460,14 +918,19 @@ def makeReturns(dl, df, horizons=1, adjustFundingRate=False):
     df : pd.DataFrame – output of agg_daniel_data (must have ticker, exchange,
          instrument columns and a ts index)
     horizons : int or list of int – forward return horizons in hours
-    adjustFundingRate : bool – if True, subtract cumulative per-hour funding cost:
-        ret_h = (price[t+h]-price[t])/price[t] - sum(funding_rate/funding_interval_hours)[t+1:t+h+1]
+    adjustFundingRate : bool – if True, subtract cumulative per-hour funding cost
+    addPumpLabel : bool – if True, add 'pump_label' (1 if peak forward return
+        within pumpForwardHours >= pumpThreshold)
+    pumpThreshold : float – return threshold (e.g. 1.5 = 150%)
+    pumpForwardHours : int – look-forward window in hours (default 14 days)
+    pumpMinHistoryHours : int – min prior history required (default 3 days);
+        rows earlier than this within a group get NaN label
 
     Returns
     -------
     pd.DataFrame indexed by ts with columns:
         ticker, exchange, instrument, price, ret_{h}h for each horizon,
-        date, hoursSinceMidnight
+        date, hoursSinceMidnight, and optionally pump_label
     """
     if isinstance(horizons, int):
         horizons = [horizons]
@@ -498,6 +961,27 @@ def makeReturns(dl, df, horizons=1, adjustFundingRate=False):
                 cum_cost = funding_per_hour.rolling(h, min_periods=h).sum().shift(-h).values
                 ret = ret - cum_cost
             all_ret[f'ret_{h}h'] = ret
+
+        # pump label: peak forward return over pumpForwardHours >= pumpThreshold
+        if addPumpLabel:
+            closes = price.values
+            n = len(closes)
+            labels = np.full(n, np.nan)
+            for i in range(n):
+                if i < pumpMinHistoryHours:
+                    continue
+                fwd_end = min(i + pumpForwardHours + 1, n)
+                if fwd_end <= i + 1:
+                    continue
+                fwd = closes[i + 1:fwd_end]
+                if len(fwd) == 0 or np.isnan(closes[i]) or closes[i] == 0:
+                    continue
+                peak = np.nanmax(fwd)
+                if np.isnan(peak):
+                    continue
+                peak_ret = peak / closes[i] - 1
+                labels[i] = 1.0 if peak_ret >= pumpThreshold else 0.0
+            all_ret['pump_label'] = labels
 
         # keep only timestamps present in df for this group
         matched = all_ret.reindex(grp.index)
@@ -530,7 +1014,7 @@ def makeXY(df1, returns, features, appender=None):
     merged = df1.merge(returns, on=keys, suffixes=('', '_ret'))
 
     # drop rows with any NaN in features or return columns
-    ret_cols = [c for c in returns.columns if c.startswith('ret_')]
+    ret_cols = [c for c in returns.columns if c.startswith('ret_') or c == 'pump_label'] 
     check_cols = features + ret_cols
     merged[check_cols] = merged[check_cols].replace([float('inf'), float('-inf')], float('nan'))
     merged = merged.dropna(subset=check_cols)
@@ -1661,3 +2145,538 @@ def getLongShortInfo(long_short, O_val):
     })
     df = df[df['signal'] != 0].sort_values('ts').reset_index(drop=True)
     return df
+
+
+def plotDailyReturnExactTrades(long_short, Y, O, horizon='ret_24h'):
+    """Plot cumsum of per-trade P&L with date-anchored x-axis.
+
+    Each trade = one row with long_short != 0.
+    x-axis: each unique date is mapped to an integer (0, 1, 2, ...). Trades
+    within a date are uniformly spaced in [date_idx, date_idx+1) — i.e., if
+    a date has N trades they land at date_idx + i/N for i=0..N-1.
+
+    Parameters
+    ----------
+    long_short : array-like (n,) – values in {+1, -1, 0}
+    Y : pd.DataFrame – must contain `horizon` column
+    O : pd.DataFrame – must contain 'date', 'hoursSinceMidnight'
+    horizon : str – return column in Y
+
+    Returns
+    -------
+    (x, cum_pnl) : tuple of np.ndarray – x positions and cumulative P&L
+    """
+    import matplotlib.pyplot as plt
+
+    ls = np.asarray(long_short, dtype=float)
+    y = Y[horizon].values
+    pnl_all = ls * y
+
+    df = pd.DataFrame({
+        'date': O['date'].values,
+        'hour': O['hoursSinceMidnight'].values,
+        'ls': ls,
+        'pnl': pnl_all,
+    })
+    df = df[df['ls'] != 0].sort_values(['date', 'hour']).reset_index(drop=True)
+    if len(df) == 0:
+        print("No trades.")
+        return np.array([]), np.array([])
+
+    # map each unique date to integer position
+    unique_dates = sorted(df['date'].unique())
+    date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+
+    # for each trade compute x = date_idx + i / N_that_date
+    xs = np.zeros(len(df))
+    for d, grp in df.groupby('date'):
+        n = len(grp)
+        idx = date_to_idx[d]
+        xs[grp.index.values] = idx + np.arange(n) / n
+
+    n_trades = len(df)
+    cum = np.cumsum(df['pnl'].fillna(0).values) / n_trades
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.plot(xs, cum, marker='.', markersize=3, linewidth=1)
+    ax.axhline(0, color='black', linestyle='--', linewidth=0.7)
+    ax.set_xlabel('date index (fractional within each day)')
+    ax.set_ylabel('cumsum(pnl) / n_trades')
+    ax.set_title(f'Per-trade cumsum/n ({horizon}, {n_trades} trades, {len(unique_dates)} days, avg={cum[-1]:.4f})')
+    ax.grid(True, alpha=0.3)
+
+    # mark integer date boundaries
+    step = max(1, len(unique_dates) // 15)
+    tick_positions = [i for i in range(0, len(unique_dates), step)]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([str(unique_dates[i]) for i in tick_positions], rotation=90, fontsize=7)
+    plt.tight_layout()
+
+    return xs, cum
+
+
+def long_short_tradeReturn(long, short, O, stoploss, min_horizon=4, max_horizon=24):
+    """Simulate long-only trades with stop-loss and short-signal exit.
+
+    For each ticker (processed independently):
+      - Walk rows in chronological order.
+      - If not in position and long[i] == 1, enter at that row's price.
+      - While in position, exit when ANY of:
+          (a) time elapsed >= max_horizon hours
+          (b) current return <= -stoploss
+          (c) short[i] == -1 AND time elapsed >= min_horizon
+      - No double-long: additional +1 signals while in position are ignored.
+
+    Parameters
+    ----------
+    long : array-like (n,) – values in {+1, 0}
+    short : array-like (n,) – values in {-1, 0}
+    O : pd.DataFrame – must contain 'ticker', 'price', 'date', 'hoursSinceMidnight'
+    stoploss : float – positive magnitude, exit when return <= -stoploss
+    min_horizon : int – hours; short signals before this don't close the long
+    max_horizon : int – hours; hard exit after this much time
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        ticker, startTime, endTime, priceStart, priceEnd, return, date
+    """
+    long = np.asarray(long, dtype=float)
+    short = np.asarray(short, dtype=float)
+
+    # reconstruct ts from date + hoursSinceMidnight (O index is RangeIndex)
+    date = O['date'].astype(int).astype(str).values
+    hour = O['hoursSinceMidnight'].astype(int).values
+    ts = pd.to_datetime(date, format='%Y%m%d', utc=True) + pd.to_timedelta(hour, unit='h')
+
+    work = pd.DataFrame({
+        'ticker': O['ticker'].values,
+        'ts': ts,
+        'date': O['date'].values,
+        'price': O['price'].values,
+        'long': long,
+        'short': short,
+    }).reset_index(drop=True)
+
+    trades = []
+    for ticker, grp in work.groupby('ticker'):
+        grp = grp.sort_values('ts').reset_index(drop=True)
+        ts_arr = grp['ts'].values
+        price = grp['price'].values
+        l = grp['long'].values
+        s = grp['short'].values
+        n = len(grp)
+
+        in_pos = False
+        entry_i = -1
+        entry_ts = None
+        entry_price = None
+
+        for i in range(n):
+            if not in_pos:
+                if l[i] == 1 and not np.isnan(price[i]):
+                    in_pos = True
+                    entry_i = i
+                    entry_ts = ts_arr[i]
+                    entry_price = price[i]
+            else:
+                # elapsed hours since entry
+                elapsed_h = (ts_arr[i] - entry_ts) / np.timedelta64(1, 'h')
+                if np.isnan(price[i]) or entry_price == 0:
+                    continue
+                cur_ret = (price[i] - entry_price) / entry_price
+
+                exit_now = False
+                if elapsed_h >= max_horizon:
+                    exit_now = True
+                elif cur_ret <= -stoploss:
+                    exit_now = True
+                elif s[i] == -1 and elapsed_h >= min_horizon:
+                    exit_now = True
+
+                if exit_now:
+                    trades.append({
+                        'ticker': ticker,
+                        'startTime': pd.Timestamp(entry_ts),
+                        'endTime': pd.Timestamp(ts_arr[i]),
+                        'priceStart': entry_price,
+                        'priceEnd': price[i],
+                        'return': cur_ret,
+                        'date': int(grp['date'].iloc[entry_i]),
+                    })
+                    in_pos = False
+                    entry_i = -1
+                    entry_ts = None
+                    entry_price = None
+
+        # if still in position at end of data, close at last available price
+        if in_pos and entry_price is not None:
+            last_price = price[-1]
+            if not np.isnan(last_price):
+                trades.append({
+                    'ticker': ticker,
+                    'startTime': pd.Timestamp(entry_ts),
+                    'endTime': pd.Timestamp(ts_arr[-1]),
+                    'priceStart': entry_price,
+                    'priceEnd': last_price,
+                    'return': (last_price - entry_price) / entry_price,
+                    'date': int(grp['date'].iloc[entry_i]),
+                })
+
+    result = pd.DataFrame(trades, columns=[
+        'ticker', 'startTime', 'endTime', 'priceStart', 'priceEnd', 'return', 'date'
+    ])
+    if len(result) > 0:
+        result['duration'] = (result['endTime'] - result['startTime']) / pd.Timedelta(hours=1)
+    else:
+        result['duration'] = []
+    return result
+
+
+def showTrade(dl, out, ticker, long_pred=None, short_pred=None, O=None):
+    """Plot Binance-futures 1h price + trade markers, optionally with pred panels.
+
+    Parameters
+    ----------
+    dl : DataLoader
+    out : pd.DataFrame – output of long_short_tradeReturn
+    ticker : str
+    long_pred, short_pred : array-like or None – predictions aligned with O's rows
+    O : pd.DataFrame or None – must contain 'ticker', 'date', 'hoursSinceMidnight';
+        required when long_pred/short_pred are passed
+    """
+    import matplotlib.pyplot as plt
+
+    raw = dl.get(ticker, 'binance', 'futures', barFreqInHours=1)
+    price = raw['close']
+    trades = out[out['ticker'] == ticker].copy()
+
+    has_preds = (long_pred is not None) and (short_pred is not None) and (O is not None)
+
+    if has_preds:
+        fig, axes = plt.subplots(3, 1, figsize=(14, 9),
+                                 gridspec_kw={'height_ratios': [3, 1, 1]},
+                                 sharex=True)
+        ax_price, ax_long, ax_short = axes
+    else:
+        fig, ax_price = plt.subplots(1, 1, figsize=(14, 5))
+
+    ax_price.plot(price.index, price.values, color='steelblue', linewidth=0.8, label='price (1h)')
+
+    if len(trades) > 0:
+        ax_price.scatter(trades['startTime'], trades['priceStart'],
+                         marker='^', color='red', s=80, zorder=5, label='open long')
+        ax_price.scatter(trades['endTime'], trades['priceEnd'],
+                         marker='v', color='green', s=80, zorder=5, label='close')
+
+    ax_price.set_ylabel('price')
+    ax_price.set_title(f'{ticker} — binance futures 1h ({len(trades)} trades)')
+    ax_price.legend(fontsize=8)
+    ax_price.grid(True, alpha=0.3)
+
+    if has_preds:
+        lp_df = getTickerPred(long_pred, O, ticker)
+        sp_df = getTickerPred(short_pred, O, ticker)
+
+        ax_long.plot(lp_df['ts'], lp_df['pred'], color='red', linewidth=0.8)
+        ax_long.axhline(0, color='black', linestyle='--', linewidth=0.5)
+        ax_long.set_ylabel('long_pred')
+        ax_long.grid(True, alpha=0.3)
+
+        ax_short.plot(sp_df['ts'], sp_df['pred'], color='green', linewidth=0.8)
+        ax_short.axhline(0, color='black', linestyle='--', linewidth=0.5)
+        ax_short.set_ylabel('short_pred')
+        ax_short.set_xlabel('time')
+        ax_short.grid(True, alpha=0.3)
+    else:
+        ax_price.set_xlabel('time')
+
+    plt.tight_layout()
+
+
+def getTickerPred(pred, O, ticker):
+    """Return a DataFrame of predictions for a single ticker, sorted by time.
+
+    Parameters
+    ----------
+    pred : array-like (n,) – prediction aligned with O's rows
+    O : pd.DataFrame – must contain 'ticker', 'date', 'hoursSinceMidnight'
+    ticker : str
+
+    Returns
+    -------
+    pd.DataFrame with columns [ts, date, hoursSinceMidnight, pred]
+        sorted by ts, filtered to the given ticker
+    """
+    pred = np.asarray(pred, dtype=float)
+    mask = (O['ticker'].values == ticker)
+    date = O.loc[mask, 'date'].astype(int).astype(str).values
+    hour = O.loc[mask, 'hoursSinceMidnight'].astype(int).values
+    ts = pd.to_datetime(date, format='%Y%m%d', utc=True) + pd.to_timedelta(hour, unit='h')
+
+    df = pd.DataFrame({
+        'ts': ts,
+        'date': O.loc[mask, 'date'].values,
+        'hoursSinceMidnight': O.loc[mask, 'hoursSinceMidnight'].values,
+        'pred': pred[mask],
+    }).sort_values('ts').reset_index(drop=True)
+    return df
+
+
+def plotAUC(pred, y, label=None, ax=None):
+    """Plot ROC curve and compute AUC from prediction probabilities and binary labels.
+
+    Parameters
+    ----------
+    pred : array-like – predicted probabilities (continuous)
+    y : array-like – binary labels (0/1); rows with NaN in either are dropped
+    label : str or None – legend label (e.g. 'train', 'val')
+    ax : matplotlib axes or None – if None, creates a new figure
+
+    Returns
+    -------
+    auc : float
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve, roc_auc_score
+
+    pred = np.asarray(pred, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = ~(np.isnan(pred) | np.isnan(y))
+    pred = pred[mask]
+    y = y[mask].astype(int)
+
+    if len(np.unique(y)) < 2:
+        raise ValueError("Need both classes (0 and 1) in y to compute AUC")
+
+    fpr, tpr, _ = roc_curve(y, pred)
+    auc = roc_auc_score(y, pred)
+
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+    lbl = f'{label} (AUC={auc:.4f})' if label else f'AUC={auc:.4f}'
+    ax.plot(fpr, tpr, linewidth=2, label=lbl)
+    ax.plot([0, 1], [0, 1], color='gray', linestyle='--', linewidth=0.8, label='random')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
+    ax.set_title(f'ROC curve (n={len(y)}, pos={y.sum()})')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    return auc
+
+
+def plotPrecisionByThreshold(pred, y, label=None):
+    """Plot precision and TP/FP counts vs threshold for binary classification.
+
+    For each threshold t, "predict 1" means pred >= t. Then:
+      - precision = TP / (TP + FP) = how much of your predicted-1 is truly 1
+      - also shown: TP count, FP count per threshold
+
+    Parameters
+    ----------
+    pred : array-like – predicted probability or score
+    y : array-like – binary labels (0/1)
+    label : str or None – title suffix
+
+    Returns
+    -------
+    pd.DataFrame with columns [threshold, TP, FP, precision, n_predicted_1]
+    """
+    import matplotlib.pyplot as plt
+
+    pred = np.asarray(pred, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = ~(np.isnan(pred) | np.isnan(y))
+    pred = pred[mask]
+    y = y[mask].astype(int)
+
+    # sort descending by prediction
+    order = np.argsort(-pred)
+    p_sorted = pred[order]
+    y_sorted = y[order]
+
+    # cumulative TP and FP as we lower the threshold
+    TP = np.cumsum(y_sorted == 1)
+    FP = np.cumsum(y_sorted == 0)
+    n_pred_pos = np.arange(1, len(y_sorted) + 1)
+    precision = TP / n_pred_pos
+    thresholds = p_sorted  # threshold = pred value at that cutoff
+
+    total_pos = int(y.sum())
+    # truncate at first index where FP/TP > 5 AND n_pred > 2 * total_pos
+    fp_tp_ratio = np.where(TP > 0, FP / np.maximum(TP, 1), np.inf)
+    stop_mask = (fp_tp_ratio > 5) & (n_pred_pos > 2 * total_pos)
+    if stop_mask.any():
+        stop_idx = np.argmax(stop_mask) + 1  # include the stop point
+        TP = TP[:stop_idx]
+        FP = FP[:stop_idx]
+        n_pred_pos = n_pred_pos[:stop_idx]
+        precision = precision[:stop_idx]
+        thresholds = thresholds[:stop_idx]
+
+    base_rate = y.sum() / len(y)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    # top: precision vs threshold
+    axes[0].plot(thresholds, precision, linewidth=1.5, color='steelblue')
+    axes[0].axhline(base_rate, color='gray', linestyle='--',
+                    label=f'base rate = {base_rate:.4f}')
+    axes[0].set_ylabel('precision (TP / predicted_1)')
+    title = 'Precision vs threshold' + (f' — {label}' if label else '')
+    axes[0].set_title(title)
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(0, 1)
+
+    # bottom: TP and FP counts
+    axes[1].plot(thresholds, TP, linewidth=1.5, color='green', label='TP')
+    axes[1].plot(thresholds, FP, linewidth=1.5, color='red', label='FP')
+    axes[1].set_xlabel('threshold (pred >= threshold counts as predicted 1)')
+    axes[1].set_ylabel('count')
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+
+    # invert x so reading left-to-right = stricter threshold
+    axes[0].invert_xaxis()
+
+    plt.tight_layout()
+
+    return pd.DataFrame({
+        'threshold': thresholds,
+        'TP': TP,
+        'FP': FP,
+        'precision': precision,
+        'n_predicted_1': n_pred_pos,
+    })
+
+
+def getLongFutureProfiles(dl, long_short, O, forward_hours=14*24,
+                          exchange='binance', instrument='futures',
+                          normalize=True):
+    """Return normalized forward price paths from each long-entry point.
+
+    For every row where long_short > 0, load the ticker's 1h price starting
+    at that entry time through entry + forward_hours.
+
+    Parameters
+    ----------
+    dl : DataLoader
+    long_short : array-like (n,) – entries where > 0 are long signals
+    O : pd.DataFrame – must contain 'ticker', 'date', 'hoursSinceMidnight'
+    forward_hours : int – how many hours forward to extract (default 14*24)
+    exchange, instrument : str – used by dl.get for price loading
+    normalize : bool – if True, divide each row by entry price (entry = 1.0)
+
+    Returns
+    -------
+    prices : pd.DataFrame of shape (n_events, forward_hours+1)
+        index = MultiIndex (ticker, entry_time); columns = hour offset (0..forward_hours)
+    """
+    ls = np.asarray(long_short, dtype=float)
+    idx = np.where(ls > 0)[0]
+    if len(idx) == 0:
+        return pd.DataFrame()
+
+    date = O['date'].astype(int).astype(str).values
+    hour = O['hoursSinceMidnight'].astype(int).values
+    ts_all = pd.to_datetime(date, format='%Y%m%d', utc=True) + pd.to_timedelta(hour, unit='h')
+    tickers_all = O['ticker'].values
+
+    cache = {}
+    rows = []
+    mi_tuples = []
+
+    for i in idx:
+        ticker = tickers_all[i]
+        entry_ts = ts_all[i]
+
+        if ticker not in cache:
+            try:
+                raw = dl.get(ticker, exchange, instrument, barFreqInHours=1)
+                cache[ticker] = raw['close']
+            except (FileNotFoundError, KeyError):
+                cache[ticker] = None
+        price_series = cache[ticker]
+        if price_series is None:
+            continue
+
+        grid = pd.date_range(start=entry_ts, periods=forward_hours + 1, freq='1h')
+        aligned = price_series.reindex(grid, method='nearest',
+                                       tolerance=pd.Timedelta(hours=1))
+        aligned = aligned.ffill().bfill()
+        entry_price = aligned.iloc[0]
+        if entry_price is None or np.isnan(entry_price) or entry_price == 0:
+            continue
+
+        vals = aligned.values / entry_price if normalize else aligned.values
+        rows.append(vals)
+        mi_tuples.append((ticker, pd.Timestamp(entry_ts)))
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows,
+                      index=pd.MultiIndex.from_tuples(mi_tuples, names=['ticker', 'entry_time']),
+                      columns=np.arange(forward_hours + 1))
+    return df
+
+
+def labelFromProfiles(arr, past_threshold=1.01, future_threshold=1.00,
+                      returnValue=False):
+    """For each (i, t), label or value based on past/future max.
+
+    For an array of shape (n, T) and each position (i, t):
+      if max(arr[i, :t]) > past_threshold:
+          NaN
+      elif max(arr[i, t:]) >= future_threshold:
+          1.0              (if returnValue=False)
+          max(arr[i, t:])  (if returnValue=True)
+      else:
+          0.0              (if returnValue=False)
+          arr[i, -1]       (if returnValue=True)
+
+    Parameters
+    ----------
+    arr : np.ndarray or pd.DataFrame of shape (n, T)
+    past_threshold : float – default 1.01
+    future_threshold : float – default 1.00
+    returnValue : bool – if True, return the value version instead of the label
+
+    Returns
+    -------
+    out : same type/shape as `arr`
+    """
+    is_df = isinstance(arr, pd.DataFrame)
+    a = np.asarray(arr, dtype=float)
+    n, T = a.shape
+
+    # past max exclusive of t
+    run_max = np.maximum.accumulate(a, axis=1)
+    past_max = np.empty_like(a)
+    past_max[:, 0] = -np.inf
+    past_max[:, 1:] = run_max[:, :-1]
+
+    # future max inclusive of t
+    future_max = np.maximum.accumulate(a[:, ::-1], axis=1)[:, ::-1]
+
+    out = np.full_like(a, np.nan)
+    past_ok = past_max < past_threshold
+    future_hit = future_max >= future_threshold
+
+    if returnValue:
+        last_vals = a[:, -1][:, None] * np.ones((1, T))
+        # future pumps: future_max
+        out[past_ok & future_hit] = future_max[past_ok & future_hit]
+        out[past_ok & ~future_hit] = last_vals[past_ok & ~future_hit]
+    else:
+        out[past_ok & future_hit] = 1.0
+        out[past_ok & ~future_hit] = 0.0
+
+    if is_df:
+        return pd.DataFrame(out, index=arr.index, columns=arr.columns)
+    return out

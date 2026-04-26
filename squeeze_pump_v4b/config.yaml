@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────
+# squeeze_pump_v4b — production config
+# Override any of these via CLI flags (--live-data, --model, ...).
+# Values match notebooks/squeeze_pump_detection_v4b.ipynb best config.
+# ─────────────────────────────────────────────────────────────────────
+
+# Paths (relative paths are resolved against the config file's folder).
+live_data_path: ../standard_data      # date-partitioned CSV root
+model_path:     ../notebooks/model_v4b_retrained.json       # XGBoost JSON or pickle
+state_path:     ./state/positions.json
+log_path:       ./log/signals.json
+
+# Universe / exchange tags.
+# primary_tag MUST be the perp exchange that supplies OI + funding.
+primary_tag:        binance_futures
+spot_tags:          [binance_spot, bybit_spot, okex_spot, bitget_spot]
+perp_tags:          [binance_futures, bybit_perps, okex_swap]
+known_tags:         [binance_futures, bybit_perps, okex_swap,
+                     binance_spot, bybit_spot, okex_spot,
+                     bitget_spot, bitget_futures]
+
+# BTC-context features (toggle must match how the model was trained).
+include_btc_features: false   # match the model: notebook trained with BTC off (25 features)
+btc_symbol:           BTCUSDT
+btc_source_tag:       binance_spot
+
+# Entry / exit (do not touch unless you retrain the model).
+entry_threshold:  0.90    # pred_xgb >= this → buy signal
+trail_pct:        0.30    # 30 % trailing stop from peak close
+stop_loss_pct:    0.50    # 50 % hard floor from entry close
+max_hold_hours:   48      # time-cap (notebook used 72)
+
+# Hard pre-filter — only bars passing both checks are scored.
+# 3-day windows only (7-day dropped — backtest/live only need 4 d of bars).
+hard_filter:
+  oi_coin_3d_chg_pct_min: 30   # OI in coin terms growing > 30 % in 3 d
+  ret_3d_pct_min:         0    # price already lifting
+
+# Feature lookback.
+lookback_hours:        96     # how far back the loader reads per tick (4 d)
+required_history_days: 3      # skip symbols with less than this much history
+
+# Live-mode data-freshness handling.
+# `probe_symbols: []` disables the global pipeline-alive heartbeat — every
+# tick reports data_status="fresh" regardless. Per-symbol staleness /
+# insufficient-history checks inside run_tick still apply (no change).
+# Set probe_symbols to a stable canary (e.g. [BTCUSDT]) and probe_tag to
+# its source folder to re-enable the heartbeat.
+freshness:
+  recheck_interval_sec: 5
+  max_wait_min:         10
+  probe_symbols:        []          # disabled — symbol universe rotates
+  probe_tag:            binance_futures
+
+# Backtest knobs — used ONLY by backtest.py (run_live ignores this section).
+# All paths are resolved relative to this YAML's folder.
+backtest:
+  # mode = "default": fast in-memory walk (positions live in RAM, freshness
+  #                   loop skipped, file layout = data_standard as-is).
+  # mode = "replay" : exact mirror of run_live.py — calls wait_for_fresh_data
+  #                   and persists state to state_path each tick. A temp
+  #                   shadow folder is built where TODAY's bars live in
+  #                   `latest.csv` (not in the dated CSV), reproducing the
+  #                   production file layout.
+  mode:            replay
+  old_data_folder: ../data_standard         # historical CSV root
+  start:           "2026-04-01"             # YYYY-MM-DD UTC; runs from 00:00 of this day
+  end:             "2026-04-03"             # YYYY-MM-DD UTC; runs through 23:59 of this day
+  out:             ../notebooks/bt_signals.csv
+  include_scored:  true                      # also emit every filter-passing pred row
+  max_symbols:     20                        # 0 = all primary symbols; small values for quick speed tests
